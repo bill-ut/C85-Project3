@@ -775,6 +775,7 @@ void AI_main(struct RoboAI *ai, struct blob *blobs, void *state)
   *****************************************************************************/
 //  fprintf(stderr,"Just trackin'!\n");	// bot, opponent, and ball.
  track_agents(ai,blobs);		// Currently, does nothing but endlessly track
+ update_state(ai);
  }
 
  return;
@@ -794,51 +795,285 @@ void AI_main(struct RoboAI *ai, struct blob *blobs, void *state)
  there.
 **********************************************************************************/
 
-/* Parameters */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ---------------- Penalty parameters ---------------- */
 double prekick_alignment_offset = -1;
 double prekick_position_tolerance = -1;
 double prekick_angle_tolerance = -1;
 
-/* Transition Function */
-void update_state(struct RoboAI *ai);
-void update_state_penalty(struct RoboAI *ai);
+/* ---------------- Movement tuning: (to be adjusted) ---------------- */
+#define TURN_SIGN        1      // If the bot spins AWAY from its target, change to -1
+#define DRIVE_POWER      30     // Forward power when driving to a point
+#define SPIN_POWER_MAX   25     // Spin power when far off target (keep low: fast spins confuse heading tracking)
+#define SPIN_POWER_MIN   10     // Spin power when nearly aligned (too low and the motors stall)
+#define STEER_GAIN       25.0   // Extra wheel power per radian of heading error while driving
+#define ANGLE_TOL        (6.0 * M_PI / 180.0)   // "Aligned" if within 6 degrees
+#define TURN_FIRST_ANGLE (35.0 * M_PI / 180.0)  // More off than this: spin in place before driving
+#define ARRIVE_TOL       25.0   // Pixels: "arrived" at a point
+#define SLOW_DIST        120.0  // Pixels: halve speed when this close to the target
+#define KICK_POWER       80     // Push-kick burst power
+#define KICK_FRAMES      6      // Push-kick burst length, in camera frames
 
-/* Robot Actions */
-// Low level instructions
-void move(struct RoboAI *ai, double duration);
-void rotate(struct RoboAI *ai, double angle);
-void kick(struct RoboAI, *ai, double power);
+static int cmd_dir = 0;         // Last drive command: +1 forward, -1 reverse, 0 spin/stopped
 
-// high level instructions
-void move_to(struct RoboAI *ai, double target_x, double target_y);
-void set_heading(struct RoboAI *ai, double dir_x, double dir_y);
+/* ---------------- Small helpers ---------------- */
 
-/* Robot State Checks */
-int in_prekick_position(struct RoboAI *ai);
-int is_goal(struct RoboAI *ai);
-
-
-/*********************************************************************************
-                         IMPLEMENTATIONS BELOW
- *********************************************************************************/
-
-void update_state(struct RoboAI *ai) {
-  int state = ai->state;
-
-  if (state < 100)
-    return;
-  else if (state < 200)
-    update_state_penalty(ai);
-  else
-    return;
+static char clamp_power(double p)
+{
+ if (p > 100) p = 100;
+ if (p < -100) p = -100;
+ return (char)p;
 }
 
-void update_state_penalty(struct RoboAI *ai) {
-  int condition_met;
-  int state = ai->state;
+double dist(double x1, double y1, double x2, double y2)
+{
+ return sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+}
 
-  if (condition_met = in_prekick_position(ai) && state = 101)
-    ai->state = 102 ? condition_met : 101;
-  else if (condition_met = is_goal(ai) && state = 102)
-    ai->state = 103 ? condition_met : 101;
+/* Signed angle (radians, -pi..pi) to rotate vector (ax,ay) onto (bx,by).
+   Positive = clockwise on screen (image y points down). */
+double signed_angle(double ax, double ay, double bx, double by)
+{
+ return atan2(ax * by - ay * bx, ax * bx + ay * by);
+}
+
+/* Consistent unit heading for our bot. The blob direction (sdx,sdy) is valid
+   even while spinning but can flip 180 degrees between frames, so we keep it
+   pointing the same way as last frame. While driving, the motion vector is
+   reliable, so we use it to fix the sign instead.
+   Returns 0 if our bot isn't visible. */
+int get_heading(struct RoboAI *ai, double *hx, double *hy)
+{
+ static double last_x = 0, last_y = 0;
+ double dx, dy, m, rx, ry;
+
+ if (ai->st.self == NULL) return 0;
+ dx = ai->st.sdx;
+ dy = ai->st.sdy;
+ m = sqrt(dx * dx + dy * dy);
+ if (m < 1e-6) return 0;
+ dx /= m;
+ dy /= m;
+
+ if (last_x == 0 && last_y == 0)  // First call after self-ID: AI_main already flipped sdx to match motion
+ {
+  last_x = dx;
+  last_y = dy;
+ }
+
+ if (cmd_dir != 0 && (ai->st.smx != 0 || ai->st.smy != 0))
+ {
+  rx = cmd_dir * ai->st.smx;  // Driving: trust the motion vector
+  ry = cmd_dir * ai->st.smy;
+ }
+ else
+ {
+  rx = last_x;  // Spinning or stopped: stay consistent with last frame
+  ry = last_y;
+ }
+
+ if (dx * rx + dy * ry < 0)
+ {
+  dx = -dx;
+  dy = -dy;
+ }
+
+ last_x = dx;
+ last_y = dy;
+ *hx = dx;
+ *hy = dy;
+ return 1;
+}
+
+/* Signed angle from our heading to point (tx,ty). Returns 0 if we can't see ourselves. */
+int angle_to(struct RoboAI *ai, double tx, double ty, double *ang)
+{
+ double hx, hy;
+ if (!get_heading(ai, &hx, &hy)) return 0;
+ *ang = signed_angle(hx, hy, tx - ai->st.self->cx, ty - ai->st.self->cy);
+ return 1;
+}
+
+/* ---------------- Low level instructions ----------------
+   All of these are called once per frame and return right away.
+   They never wait, so the camera loop keeps running. */
+
+void stop(struct RoboAI *ai)
+{
+ BT_all_stop(1);  // 1 = active brake
+ cmd_dir = 0;
+}
+
+/* Drive straight. power > 0 forward (tongs first), < 0 reverse. */
+void move(struct RoboAI *ai, double power)
+{
+ BT_drive(LEFT_MOTOR, RIGHT_MOTOR, clamp_power(power));
+ cmd_dir = (power > 0) ? 1 : ((power < 0) ? -1 : 0);
+}
+
+/* Spin in place to reduce 'angle' (radians, + = clockwise on screen).
+   Pass in the remaining error every frame. Returns 1 (and stops) once within ANGLE_TOL. */
+int rotate(struct RoboAI *ai, double angle)
+{
+ double p;
+
+ if (fabs(angle) < ANGLE_TOL)
+ {
+  stop(ai);
+  return 1;
+ }
+
+ p = SPIN_POWER_MIN + (SPIN_POWER_MAX - SPIN_POWER_MIN) * fmin(fabs(angle) / M_PI, 1.0);
+ if (angle * TURN_SIGN > 0)
+  BT_turn(LEFT_MOTOR, clamp_power(p), RIGHT_MOTOR, clamp_power(-p));
+ else
+  BT_turn(LEFT_MOTOR, clamp_power(-p), RIGHT_MOTOR, clamp_power(p));
+ cmd_dir = 0;
+ return 0;
+}
+
+/* Push-kick (no kicker yet): short fast burst forward, then brake.
+   Call every frame while in the kick state. Returns 1 when the kick is finished. */
+int kick(struct RoboAI *ai, double power)
+{
+ static int frames = 0;
+
+ if (frames < KICK_FRAMES)
+ {
+  move(ai, power);
+  frames++;
+  return 0;
+ }
+ stop(ai);
+ frames = 0;
+ return 1;
+}
+
+/* ---------------- High level instructions ---------------- */
+
+/* Turn in place to face direction (dir_x, dir_y). Returns 1 once aligned. */
+int set_heading(struct RoboAI *ai, double dir_x, double dir_y)
+{
+ double hx, hy;
+
+ if (!get_heading(ai, &hx, &hy))
+ {
+  stop(ai);
+  return 0;
+ }
+ return rotate(ai, signed_angle(hx, hy, dir_x, dir_y));
+}
+
+/* Drive to point (target_x, target_y), steering as it goes.
+   Spins in place first if the target is far off to the side.
+   Returns 1 (and stops) once within ARRIVE_TOL pixels. */
+int move_to(struct RoboAI *ai, double target_x, double target_y)
+{
+ double ang, d, base, corr;
+
+ if (ai->st.self == NULL)
+ {
+  stop(ai);
+  return 0;
+ }
+
+ // Debug: red cross on the target (clears the whole display list each frame)
+ ai->DPhead = clearDP(ai->DPhead);
+ ai->DPhead = addCross(ai->DPhead, (int)target_x, (int)target_y, 10, 255, 0, 0);
+
+ d = dist(ai->st.self->cx, ai->st.self->cy, target_x, target_y);
+ if (d < ARRIVE_TOL)
+ {
+  stop(ai);
+  return 1;
+ }
+
+ if (!angle_to(ai, target_x, target_y, &ang))
+ {
+  stop(ai);
+  return 0;
+ }
+
+ if (fabs(ang) > TURN_FIRST_ANGLE)
+ {
+  rotate(ai, ang);
+  return 0;
+ }
+
+ base = (d < SLOW_DIST) ? DRIVE_POWER / 2.0 : DRIVE_POWER;
+ corr = STEER_GAIN * ang * TURN_SIGN;
+ if (corr > base) corr = base;
+ if (corr < -base) corr = -base;
+ BT_turn(LEFT_MOTOR, clamp_power(base + corr), RIGHT_MOTOR, clamp_power(base - corr));
+ cmd_dir = 1;
+ return 0;
+}
+
+/* ---------------- Robot state checks ---------------- */
+
+int in_prekick_position(struct RoboAI *ai)
+{
+ return 0;   // TODO
+}
+
+int is_goal(struct RoboAI *ai)
+{
+ return 0;   // TODO
+}
+
+/* ---------------- Quick movement test using CHASE mode (states 201-202) ----------------
+   Run with mode 2 to test move_to/rotate/kick on the real field.
+   201: drive to the ball. 202: push-kick, then back to 201. */
+#define BALL_REACH 70.0   // Pixels from our centre to the ball when it sits in the tongs: measure this!
+
+void chase_test(struct RoboAI *ai)
+{
+ double ang;
+
+ if (ai->st.self == NULL || ai->st.ball == NULL)   // Lost track of something: stop, don't crash
+ {
+  stop(ai);
+  return;
+ }
+
+ if (ai->st.state == 201)
+ {
+  if (dist(ai->st.self->cx, ai->st.self->cy, ai->st.ball->cx, ai->st.ball->cy) < BALL_REACH
+      && angle_to(ai, ai->st.ball->cx, ai->st.ball->cy, &ang) && fabs(ang) < 3 * ANGLE_TOL)
+   ai->st.state = 202;
+  else
+   move_to(ai, ai->st.ball->cx, ai->st.ball->cy);
+ }
+ else if (ai->st.state == 202)
+ {
+  if (kick(ai, KICK_POWER))
+   ai->st.state = 201;
+ }
+}
+
+/* ---------------- Transition functions ---------------- */
+
+void update_state(struct RoboAI *ai)
+{
+ int state = ai->st.state;
+
+ if (state < 100)
+  return; // Soccer mode: not yet
+ else if (state < 200)
+  update_state_penalty(ai);
+ else if (state < 300)
+  chase_test(ai);
+}
+
+void update_state_penalty(struct RoboAI *ai)
+{
+ int state = ai->st.state;
+
+ if (state == 101 && in_prekick_position(ai))
+  ai->st.state = 102;
+ else if (state == 102 && is_goal(ai))
+  ai->st.state = 103;
 }

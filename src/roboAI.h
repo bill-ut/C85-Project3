@@ -151,4 +151,29 @@ struct displayList *clearDP(struct displayList *head);
    playing functionality below.
 *****************************************************************************/
 
+/* Transition functions */
+void update_state(struct RoboAI *ai);
+void update_state_penalty(struct RoboAI *ai);
+void chase_test(struct RoboAI *ai);
+
+/* Helpers */
+double dist(double x1, double y1, double x2, double y2);
+double signed_angle(double ax, double ay, double bx, double by);
+int get_heading(struct RoboAI *ai, double *hx, double *hy);
+int angle_to(struct RoboAI *ai, double tx, double ty, double *ang);
+
+/* Low level instructions (call once per frame, never block) */
+void stop(struct RoboAI *ai);
+void move(struct RoboAI *ai, double power);
+int rotate(struct RoboAI *ai, double angle);
+int kick(struct RoboAI *ai, double power);
+
+/* High level instructions (return 1 when done) */
+int set_heading(struct RoboAI *ai, double dir_x, double dir_y);
+int move_to(struct RoboAI *ai, double target_x, double target_y);
+
+/* Robot state checks */
+int in_prekick_position(struct RoboAI *ai);
+int is_goal(struct RoboAI *ai);
+
 #endif
