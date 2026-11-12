@@ -801,13 +801,44 @@ double prekick_angle_tolerance = -1;
 
 /* Transition Function */
 void update_state(struct RoboAI *ai);
+void update_state_penalty(struct RoboAI *ai);
 
 /* Robot Actions */
-void move_to(struct RoboAI *ai, double target_x, double target_y);
+// Low level instructions
+void move(struct RoboAI *ai, double duration);
 void rotate(struct RoboAI *ai, double angle);
 void kick(struct RoboAI, *ai, double power);
+
+// high level instructions
+void move_to(struct RoboAI *ai, double target_x, double target_y);
+void set_heading(struct RoboAI *ai, double dir_x, double dir_y);
 
 /* Robot State Checks */
 int in_prekick_position(struct RoboAI *ai);
 int is_goal(struct RoboAI *ai);
 
+
+/*********************************************************************************
+                         IMPLEMENTATIONS BELOW
+ *********************************************************************************/
+
+void update_state(struct RoboAI *ai) {
+  int state = ai->state;
+
+  if (state < 100)
+    return;
+  else if (state < 200)
+    update_state_penalty(ai);
+  else
+    return;
+}
+
+void update_state_penalty(struct RoboAI *ai) {
+  int condition_met;
+  int state = ai->state;
+
+  if (condition_met = in_prekick_position(ai) && state = 101)
+    ai->state = 102 ? condition_met : 101;
+  else if (condition_met = is_goal(ai) && state = 102)
+    ai->state = 103 ? condition_met : 101;
+}
