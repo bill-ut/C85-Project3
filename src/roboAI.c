@@ -774,9 +774,10 @@ void AI_main(struct RoboAI *ai, struct blob *blobs, void *state)
    the bot is supposed to be doing.
   *****************************************************************************/
 //  fprintf(stderr,"Just trackin'!\n");	// bot, opponent, and ball.
-//  track_agents(ai,blobs);		// Currently, does nothing but endlessly track
+ track_agents(ai,blobs);		// Currently, does nothing but endlessly track
  }
 
+ return;
 }
 
 /**********************************************************************************
@@ -793,4 +794,20 @@ void AI_main(struct RoboAI *ai, struct blob *blobs, void *state)
  there.
 **********************************************************************************/
 
+/* Parameters */
+double prekick_alignment_offset = -1;
+double prekick_position_tolerance = -1;
+double prekick_angle_tolerance = -1;
+
+/* Transition Function */
+void update_state(struct RoboAI *ai);
+
+/* Robot Actions */
+void move_to(struct RoboAI *ai, double target_x, double target_y);
+void rotate(struct RoboAI *ai, double angle);
+void kick(struct RoboAI, *ai, double power);
+
+/* Robot State Checks */
+int in_prekick_position(struct RoboAI *ai);
+int is_goal(struct RoboAI *ai);
 
